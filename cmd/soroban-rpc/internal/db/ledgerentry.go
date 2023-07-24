@@ -3,12 +3,14 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 
 	sq "github.com/Masterminds/squirrel"
-	"github.com/jmoiron/sqlx"
 
+	"github.com/stellar/go/support/db"
+	"github.com/stellar/go/support/errors"
 	"github.com/stellar/go/xdr"
 )
 
@@ -23,12 +25,13 @@ type LedgerEntryReader interface {
 
 type LedgerEntryReadTx interface {
 	GetLatestLedgerSequence() (uint32, error)
-	GetLedgerEntry(key xdr.LedgerKey) (bool, xdr.LedgerEntry, error)
+	GetLedgerEntry(key xdr.LedgerKey, includeExpired bool) (bool, xdr.LedgerEntry, error)
 	Done() error
 }
 
 type LedgerEntryWriter interface {
-	UpsertLedgerEntry(key xdr.LedgerKey, entry xdr.LedgerEntry) error
+	ExtendLedgerEntry(key xdr.LedgerKey, expirationLedgerSeq xdr.Uint32) error
+	UpsertLedgerEntry(entry xdr.LedgerEntry) error
 	DeleteLedgerEntry(key xdr.LedgerKey) error
 }
 
@@ -40,7 +43,61 @@ type ledgerEntryWriter struct {
 	maxBatchSize    int
 }
 
-func (l ledgerEntryWriter) UpsertLedgerEntry(key xdr.LedgerKey, entry xdr.LedgerEntry) error {
+func (l ledgerEntryWriter) ExtendLedgerEntry(key xdr.LedgerKey, expirationLedgerSeq xdr.Uint32) error {
+	// TODO: How do we figure out the current expiration? We might need to read
+	// from the DB, but in the case of creating a new entry and immediately
+	// extending it, or extending multiple times in the same ledger, the
+	// expirationLedgerSeq might be buffered but not flushed yet.
+	if key.Type != xdr.LedgerEntryTypeContractCode && key.Type != xdr.LedgerEntryTypeContractData {
+		panic("ExtendLedgerEntry can only be used for contract code and data")
+	}
+
+	encodedKey, err := encodeLedgerKey(l.buffer, key)
+	if err != nil {
+		return err
+	}
+
+	var entry xdr.LedgerEntry
+	var existing string
+	// See if we have a pending (unflushed) update for this key
+	queued := l.keyToEntryBatch[encodedKey]
+	if queued != nil && *queued != "" {
+		existing = *queued
+	} else {
+		// Nothing in the flush buffer. Load the entry from the db
+		err = sq.StatementBuilder.RunWith(l.stmtCache).Select("entry").From(ledgerEntriesTableName).Where(sq.Eq{"key": encodedKey}).QueryRow().Scan(&existing)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("no entry for key %q in table %q", base64.StdEncoding.EncodeToString([]byte(encodedKey)), ledgerEntriesTableName)
+		} else if err != nil {
+			return err
+		}
+	}
+
+	// Unmarshal the existing entry
+	if err := xdr.SafeUnmarshal([]byte(existing), &entry); err != nil {
+		return err
+	}
+
+	// Update the expiration
+	switch entry.Data.Type {
+	case xdr.LedgerEntryTypeContractData:
+		entry.Data.ContractData.ExpirationLedgerSeq = expirationLedgerSeq
+	case xdr.LedgerEntryTypeContractCode:
+		entry.Data.ContractCode.ExpirationLedgerSeq = expirationLedgerSeq
+	}
+
+	// Marshal the entry back and stage it
+	return l.UpsertLedgerEntry(entry)
+}
+
+func (l ledgerEntryWriter) UpsertLedgerEntry(entry xdr.LedgerEntry) error {
+	// We can do a little extra validation to ensure the entry and key match,
+	// because the key can be derived from the entry.
+	key, err := entry.LedgerKey()
+	if err != nil {
+		return errors.Wrap(err, "could not get ledger key from entry")
+	}
+
 	encodedKey, err := encodeLedgerKey(l.buffer, key)
 	if err != nil {
 		return err
@@ -108,26 +165,31 @@ func (l ledgerEntryWriter) flush() error {
 }
 
 type ledgerEntryReadTx struct {
-	tx     *sqlx.Tx
-	buffer *xdr.EncodingBuffer
+	cachedLatestLedgerSeq uint32
+	tx                    db.SessionInterface
+	buffer                *xdr.EncodingBuffer
 }
 
-func (l ledgerEntryReadTx) GetLatestLedgerSequence() (uint32, error) {
-	return getLatestLedgerSequence(context.Background(), l.tx)
+func (l *ledgerEntryReadTx) GetLatestLedgerSequence() (uint32, error) {
+	if l.cachedLatestLedgerSeq != 0 {
+		return l.cachedLatestLedgerSeq, nil
+	}
+	latestLedgerSeq, err := getLatestLedgerSequence(context.Background(), l.tx)
+	if err != nil {
+		l.cachedLatestLedgerSeq = latestLedgerSeq
+	}
+	return latestLedgerSeq, err
 }
 
-func (l ledgerEntryReadTx) GetLedgerEntry(key xdr.LedgerKey) (bool, xdr.LedgerEntry, error) {
+func (l *ledgerEntryReadTx) GetLedgerEntry(key xdr.LedgerKey, includeExpired bool) (bool, xdr.LedgerEntry, error) {
 	encodedKey, err := encodeLedgerKey(l.buffer, key)
 	if err != nil {
 		return false, xdr.LedgerEntry{}, err
 	}
 
-	sqlStr, args, err := sq.Select("entry").From(ledgerEntriesTableName).Where(sq.Eq{"key": encodedKey}).ToSql()
-	if err != nil {
-		return false, xdr.LedgerEntry{}, err
-	}
+	sql := sq.Select("entry").From(ledgerEntriesTableName).Where(sq.Eq{"key": encodedKey})
 	var results []string
-	if err = l.tx.Select(&results, sqlStr, args...); err != nil {
+	if err = l.tx.Select(context.Background(), &results, sql); err != nil {
 		return false, xdr.LedgerEntry{}, err
 	}
 	switch len(results) {
@@ -143,6 +205,21 @@ func (l ledgerEntryReadTx) GetLedgerEntry(key xdr.LedgerKey) (bool, xdr.LedgerEn
 	if err = xdr.SafeUnmarshal([]byte(ledgerEntryBin), &result); err != nil {
 		return false, xdr.LedgerEntry{}, err
 	}
+
+	// Disallow access to entries that have expired. Expiration excludes the
+	// "current" ledger, which we are building.
+	if !includeExpired {
+		if expirationLedgerSeq, ok := result.Data.ExpirationLedgerSeq(); ok {
+			latestClosedLedger, err := l.GetLatestLedgerSequence()
+			if err != nil {
+				return false, xdr.LedgerEntry{}, err
+			}
+			if expirationLedgerSeq <= xdr.Uint32(latestClosedLedger) {
+				return false, xdr.LedgerEntry{}, nil
+			}
+		}
+	}
+
 	return true, result, nil
 }
 
@@ -153,10 +230,10 @@ func (l ledgerEntryReadTx) Done() error {
 }
 
 type ledgerEntryReader struct {
-	db *sqlx.DB
+	db db.SessionInterface
 }
 
-func NewLedgerEntryReader(db *sqlx.DB) LedgerEntryReader {
+func NewLedgerEntryReader(db db.SessionInterface) LedgerEntryReader {
 	return ledgerEntryReader{db: db}
 }
 
@@ -165,13 +242,15 @@ func (r ledgerEntryReader) GetLatestLedgerSequence(ctx context.Context) (uint32,
 }
 
 func (r ledgerEntryReader) NewTx(ctx context.Context) (LedgerEntryReadTx, error) {
-	tx, err := r.db.BeginTxx(ctx, &sql.TxOptions{
-		ReadOnly: true,
-	})
-	return ledgerEntryReadTx{
-		tx:     tx,
+	txSession := r.db.Clone()
+	if err := txSession.BeginTx(ctx, &sql.TxOptions{ReadOnly: true}); err != nil {
+		return nil, err
+	}
+
+	return &ledgerEntryReadTx{
+		tx:     txSession,
 		buffer: xdr.NewEncodingBuffer(),
-	}, err
+	}, nil
 }
 
 func encodeLedgerKey(buffer *xdr.EncodingBuffer, key xdr.LedgerKey) (string, error) {

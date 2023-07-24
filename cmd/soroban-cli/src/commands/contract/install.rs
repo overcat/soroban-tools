@@ -2,30 +2,27 @@ use std::array::TryFromSliceError;
 use std::fmt::Debug;
 use std::num::ParseIntError;
 
-use clap::Parser;
-use soroban_env_host::xdr::{
-    Error as XdrError, Hash, HostFunction, InstallContractCodeArgs, InvokeHostFunctionOp,
-    LedgerFootprint, LedgerKey::ContractCode, LedgerKeyContractCode, Memo, MuxedAccount, Operation,
-    OperationBody, Preconditions, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
-    Uint256, VecM,
-};
-use soroban_env_host::HostError;
-
 use crate::rpc::{self, Client};
 use crate::{commands::config, utils, wasm};
+use clap::{command, Parser};
+use soroban_env_host::xdr::{
+    Error as XdrError, Hash, HostFunction, InvokeHostFunctionOp, Memo, MuxedAccount, Operation,
+    OperationBody, Preconditions, SequenceNumber, Transaction, TransactionExt, Uint256, VecM,
+};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
+#[group(skip)]
 pub struct Cmd {
-    #[clap(flatten)]
-    pub wasm: wasm::Args,
-    #[clap(flatten)]
+    #[command(flatten)]
     pub config: config::Args,
+    #[command(flatten)]
+    pub fee: crate::fee::Args,
+    #[command(flatten)]
+    pub wasm: wasm::Args,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error(transparent)]
-    Host(#[from] HostError),
     #[error("error parsing int: {0}")]
     ParseIntError(#[from] ParseIntError),
     #[error("internal conversion error: {0}")]
@@ -40,16 +37,18 @@ pub enum Error {
     Config(#[from] config::Error),
     #[error(transparent)]
     Wasm(#[from] wasm::Error),
+    #[error("unexpected ({length}) simulate transaction result length")]
+    UnexpectedSimulateTransactionResultSize { length: usize },
 }
 
 impl Cmd {
     pub async fn run(&self) -> Result<(), Error> {
-        let res_str = self.run_and_get_hash().await?;
+        let res_str = hex::encode(self.run_and_get_hash().await?);
         println!("{res_str}");
         Ok(())
     }
 
-    pub async fn run_and_get_hash(&self) -> Result<String, Error> {
+    pub async fn run_and_get_hash(&self) -> Result<Hash, Error> {
         let contract = self.wasm.read()?;
         if self.config.is_no_network() {
             self.run_in_sandbox(contract)
@@ -58,61 +57,60 @@ impl Cmd {
         }
     }
 
-    fn run_in_sandbox(&self, contract: Vec<u8>) -> Result<String, Error> {
+    pub fn run_in_sandbox(&self, contract: Vec<u8>) -> Result<Hash, Error> {
         let mut state = self.config.get_state()?;
-        let wasm_hash =
-            utils::add_contract_code_to_ledger_entries(&mut state.ledger_entries, contract)?;
+        let wasm_hash = utils::add_contract_code_to_ledger_entries(
+            &mut state.ledger_entries,
+            contract,
+            state.min_persistent_entry_expiration,
+        )?;
 
         self.config.set_state(&mut state)?;
 
-        Ok(hex::encode(wasm_hash))
+        Ok(wasm_hash)
     }
 
-    async fn run_against_rpc_server(&self, contract: Vec<u8>) -> Result<String, Error> {
+    async fn run_against_rpc_server(&self, contract: Vec<u8>) -> Result<Hash, Error> {
         let network = self.config.get_network()?;
-        let client = Client::new(&network.rpc_url);
+        let client = Client::new(&network.rpc_url)?;
+        client
+            .verify_network_passphrase(Some(&network.network_passphrase))
+            .await?;
         let key = self.config.key_pair()?;
 
         // Get the account sequence number
         let public_strkey = stellar_strkey::ed25519::PublicKey(key.public.to_bytes()).to_string();
         let account_details = client.get_account(&public_strkey).await?;
-        // TODO: create a cmdline parameter for the fee instead of simply using the minimum fee
-        let fee: u32 = 100;
         let sequence: i64 = account_details.seq_num.into();
 
-        let (tx, hash) = build_install_contract_code_tx(
-            contract,
-            sequence + 1,
-            fee,
-            &network.network_passphrase,
-            &key,
-        )?;
-        client.send_transaction(&tx).await?;
+        let (tx_without_preflight, hash) =
+            build_install_contract_code_tx(contract.clone(), sequence + 1, self.fee.fee, &key)?;
 
-        Ok(hex::encode(hash.0))
+        client
+            .prepare_and_send_transaction(
+                &tx_without_preflight,
+                &key,
+                &network.network_passphrase,
+                None,
+            )
+            .await?;
+
+        Ok(hash)
     }
 }
 
 pub(crate) fn build_install_contract_code_tx(
-    contract: Vec<u8>,
+    source_code: Vec<u8>,
     sequence: i64,
     fee: u32,
-    network_passphrase: &str,
     key: &ed25519_dalek::Keypair,
-) -> Result<(TransactionEnvelope, Hash), XdrError> {
-    let hash = utils::contract_hash(&contract)?;
+) -> Result<(Transaction, Hash), XdrError> {
+    let hash = utils::contract_hash(&source_code)?;
 
     let op = Operation {
-        source_account: None,
+        source_account: Some(MuxedAccount::Ed25519(Uint256(key.public.to_bytes()))),
         body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-            function: HostFunction::InstallContractCode(InstallContractCodeArgs {
-                code: contract.try_into()?,
-            }),
-            footprint: LedgerFootprint {
-                read_only: VecM::default(),
-                read_write: vec![ContractCode(LedgerKeyContractCode { hash: hash.clone() })]
-                    .try_into()?,
-            },
+            host_function: HostFunction::UploadContractWasm(source_code.try_into()?),
             auth: VecM::default(),
         }),
     };
@@ -127,9 +125,7 @@ pub(crate) fn build_install_contract_code_tx(
         ext: TransactionExt::V0,
     };
 
-    let envelope = utils::sign_transaction(key, &tx, network_passphrase)?;
-
-    Ok((envelope, hash))
+    Ok((tx, hash))
 }
 
 #[cfg(test)]
@@ -142,7 +138,6 @@ mod tests {
             b"foo".to_vec(),
             300,
             1,
-            "Public Global Stellar Network ; September 2015",
             &utils::parse_secret_key("SBFGFF27Y64ZUGFAIG5AMJGQODZZKV2YQKAVUUN4HNE24XZXD2OEUVUP")
                 .unwrap(),
         );

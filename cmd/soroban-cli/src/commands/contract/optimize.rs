@@ -1,15 +1,17 @@
-use clap::Parser;
+use clap::{arg, command, Parser};
 use std::fmt::Debug;
+#[cfg(feature = "opt")]
 use wasm_opt::{OptimizationError, OptimizationOptions};
 
 use crate::wasm;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
+#[group(skip)]
 pub struct Cmd {
-    #[clap(flatten)]
+    #[command(flatten)]
     wasm: wasm::Args,
     /// Path to write the optimized WASM file to (defaults to same location as --wasm with .optimized.wasm suffix)
-    #[clap(long, parse(from_os_str))]
+    #[arg(long)]
     wasm_out: Option<std::path::PathBuf>,
 }
 
@@ -17,11 +19,21 @@ pub struct Cmd {
 pub enum Error {
     #[error(transparent)]
     Wasm(#[from] wasm::Error),
+    #[cfg(feature = "opt")]
     #[error("optimization error: {0}")]
     OptimizationError(OptimizationError),
+    #[cfg(not(feature = "opt"))]
+    #[error("Must install with \"opt\" feature, e.g. `cargo install soroban-cli --features opt")]
+    Install,
 }
 
 impl Cmd {
+    #[cfg(not(feature = "opt"))]
+    pub fn run(&self) -> Result<(), Error> {
+        Err(Error::Install)
+    }
+
+    #[cfg(feature = "opt")]
     pub fn run(&self) -> Result<(), Error> {
         let wasm_size = self.wasm.len()?;
 

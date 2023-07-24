@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/stellar/go/network"
+	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/daemon/interfaces"
 	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/transactions"
 )
 
@@ -43,17 +44,16 @@ func transactionResult(successful bool) xdr.TransactionResult {
 func txMeta(acctSeq uint32, successful bool) xdr.LedgerCloseMeta {
 	envelope := txEnvelope(acctSeq)
 
-	txProcessing := []xdr.TransactionResultMetaV2{
+	txProcessing := []xdr.TransactionResultMeta{
 		{
 			TxApplyProcessing: xdr.TransactionMeta{
 				V:          3,
 				Operations: &[]xdr.OperationMeta{},
-				V3: &xdr.TransactionMetaV3{
-					TxResult: transactionResult(successful),
-				},
+				V3:         &xdr.TransactionMetaV3{},
 			},
-			Result: xdr.TransactionResultPairV2{
+			Result: xdr.TransactionResultPair{
 				TransactionHash: txHash(acctSeq),
+				Result:          transactionResult(successful),
 			},
 		},
 	}
@@ -112,9 +112,8 @@ func txEnvelope(acctSeq uint32) xdr.TransactionEnvelope {
 }
 
 func TestGetTransaction(t *testing.T) {
-	store, err := transactions.NewMemoryStore("passphrase", 100)
-	assert.NoError(t, err)
-	_, err = GetTransaction(store, GetTransactionRequest{"ab"})
+	store := transactions.NewMemoryStore(interfaces.MakeNoOpDeamon(), "passphrase", 100)
+	_, err := GetTransaction(store, GetTransactionRequest{"ab"})
 	assert.EqualError(t, err, "[-32602] unexpected hash length (2)")
 	_, err = GetTransaction(store, GetTransactionRequest{"foo                                                              "})
 	assert.EqualError(t, err, "[-32602] incorrect hash: encoding/hex: invalid byte: U+006F 'o'")
@@ -135,7 +134,7 @@ func TestGetTransaction(t *testing.T) {
 	tx, err = GetTransaction(store, GetTransactionRequest{hash})
 	assert.NoError(t, err)
 
-	expectedTxResult, err := xdr.MarshalBase64(meta.V2.TxProcessing[0].TxApplyProcessing.V3.TxResult)
+	expectedTxResult, err := xdr.MarshalBase64(meta.V2.TxProcessing[0].Result.Result)
 	assert.NoError(t, err)
 	expectedEnvelope, err := xdr.MarshalBase64(txEnvelope(1))
 	assert.NoError(t, err)
@@ -183,7 +182,7 @@ func TestGetTransaction(t *testing.T) {
 	xdrHash = txHash(2)
 	hash = hex.EncodeToString(xdrHash[:])
 
-	expectedTxResult, err = xdr.MarshalBase64(meta.V2.TxProcessing[0].TxApplyProcessing.V3.TxResult)
+	expectedTxResult, err = xdr.MarshalBase64(meta.V2.TxProcessing[0].Result.Result)
 	assert.NoError(t, err)
 	expectedEnvelope, err = xdr.MarshalBase64(txEnvelope(2))
 	assert.NoError(t, err)

@@ -3,10 +3,10 @@ package transactions
 import (
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/stellar/go/network"
 	"github.com/stellar/go/xdr"
+	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/daemon/interfaces"
+	"github.com/stretchr/testify/require"
 )
 
 func expectedTransaction(ledger uint32, feeBump bool) Transaction {
@@ -15,9 +15,7 @@ func expectedTransaction(ledger uint32, feeBump bool) Transaction {
 		Meta: xdr.TransactionMeta{
 			V:          3,
 			Operations: &[]xdr.OperationMeta{},
-			V3: &xdr.TransactionMetaV3{
-				TxResult: transactionResult(ledger, feeBump),
-			},
+			V3:         &xdr.TransactionMetaV3{},
 		},
 		Envelope:         txEnvelope(ledger, feeBump),
 		FeeBump:          feeBump,
@@ -83,17 +81,16 @@ func transactionResult(ledgerSequence uint32, feeBump bool) xdr.TransactionResul
 func txMeta(ledgerSequence uint32, feeBump bool) xdr.LedgerCloseMeta {
 	envelope := txEnvelope(ledgerSequence, feeBump)
 
-	txProcessing := []xdr.TransactionResultMetaV2{
+	txProcessing := []xdr.TransactionResultMeta{
 		{
 			TxApplyProcessing: xdr.TransactionMeta{
 				V:          3,
 				Operations: &[]xdr.OperationMeta{},
-				V3: &xdr.TransactionMetaV3{
-					TxResult: transactionResult(ledgerSequence, feeBump),
-				},
+				V3:         &xdr.TransactionMetaV3{},
 			},
-			Result: xdr.TransactionResultPairV2{
+			Result: xdr.TransactionResultPair{
 				TransactionHash: txHash(ledgerSequence, feeBump),
+				Result:          transactionResult(ledgerSequence, feeBump),
 			},
 		},
 	}
@@ -187,8 +184,7 @@ func requirePresent(t *testing.T, store *MemoryStore, feeBump bool, ledgerSequen
 
 func TestIngestTransactions(t *testing.T) {
 	// Use a small retention window to test eviction
-	store, err := NewMemoryStore("passphrase", 3)
-	require.NoError(t, err)
+	store := NewMemoryStore(interfaces.MakeNoOpDeamon(), "passphrase", 3)
 
 	_, ok, storeRange := store.GetTransaction(txHash(1, false))
 	require.False(t, ok)

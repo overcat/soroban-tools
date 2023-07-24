@@ -5,10 +5,13 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stellar/go/ingest"
 	"github.com/stellar/go/xdr"
 
+	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/daemon/interfaces"
 	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/ledgerbucketwindow"
 )
 
@@ -19,7 +22,7 @@ type bucket struct {
 }
 
 type event struct {
-	contents   xdr.ContractEvent
+	contents   xdr.DiagnosticEvent
 	txIndex    uint32
 	opIndex    uint32
 	eventIndex uint32
@@ -42,8 +45,10 @@ type MemoryStore struct {
 	// by the lock
 	networkPassphrase string
 	// lock protects the mutable fields below
-	lock           sync.RWMutex
-	eventsByLedger *ledgerbucketwindow.LedgerBucketWindow[[]event]
+	lock                 sync.RWMutex
+	eventsByLedger       *ledgerbucketwindow.LedgerBucketWindow[[]event]
+	eventsDurationMetric *prometheus.SummaryVec
+	eventCountMetric     prometheus.Summary
 }
 
 // NewMemoryStore creates a new MemoryStore.
@@ -53,15 +58,28 @@ type MemoryStore struct {
 // will be included in the MemoryStore. If the MemoryStore
 // is full, any events from new ledgers will evict
 // older entries outside the retention window.
-func NewMemoryStore(networkPassphrase string, retentionWindow uint32) (*MemoryStore, error) {
-	window, err := ledgerbucketwindow.NewLedgerBucketWindow[[]event](retentionWindow)
-	if err != nil {
-		return nil, err
-	}
+func NewMemoryStore(daemon interfaces.Daemon, networkPassphrase string, retentionWindow uint32) *MemoryStore {
+	window := ledgerbucketwindow.NewLedgerBucketWindow[[]event](retentionWindow)
+
+	// eventsDurationMetric is a metric for measuring latency of event store operations
+	eventsDurationMetric := prometheus.NewSummaryVec(prometheus.SummaryOpts{
+		Namespace: daemon.MetricsNamespace(), Subsystem: "events", Name: "operation_duration_seconds",
+		Help: "event store operation durations, sliding window = 10m",
+	},
+		[]string{"operation"},
+	)
+
+	eventCountMetric := prometheus.NewSummary(prometheus.SummaryOpts{
+		Namespace: daemon.MetricsNamespace(), Subsystem: "events", Name: "count",
+		Help: "count of events ingested, sliding window = 10m",
+	})
+	daemon.MetricsRegistry().MustRegister(eventCountMetric, eventsDurationMetric)
 	return &MemoryStore{
-		networkPassphrase: networkPassphrase,
-		eventsByLedger:    window,
-	}, nil
+		networkPassphrase:    networkPassphrase,
+		eventsByLedger:       window,
+		eventsDurationMetric: eventsDurationMetric,
+		eventCountMetric:     eventCountMetric,
+	}
 }
 
 // Range defines a [Start, End) interval of Soroban events.
@@ -84,7 +102,8 @@ type Range struct {
 // remaining events in the range). Note that a read lock is held for the
 // entire duration of the Scan function so f should be written in a way
 // to minimize latency.
-func (m *MemoryStore) Scan(eventRange Range, f func(xdr.ContractEvent, Cursor, int64) bool) (uint32, error) {
+func (m *MemoryStore) Scan(eventRange Range, f func(xdr.DiagnosticEvent, Cursor, int64) bool) (uint32, error) {
+	startTime := time.Now()
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
@@ -113,6 +132,8 @@ func (m *MemoryStore) Scan(eventRange Range, f func(xdr.ContractEvent, Cursor, i
 			}
 		}
 	}
+	m.eventsDurationMetric.With(prometheus.Labels{"operation": "scan"}).
+		Observe(time.Since(startTime).Seconds())
 	return lastLedgerInWindow, nil
 }
 
@@ -165,6 +186,7 @@ func seek(events []event, cursor Cursor) []event {
 // As a side effect, events which fall outside the retention window are
 // removed from the store.
 func (m *MemoryStore) IngestEvents(ledgerCloseMeta xdr.LedgerCloseMeta) error {
+	startTime := time.Now()
 	// no need to acquire the lock because the networkPassphrase field
 	// is immutable
 	events, err := readEvents(m.networkPassphrase, ledgerCloseMeta)
@@ -179,7 +201,10 @@ func (m *MemoryStore) IngestEvents(ledgerCloseMeta xdr.LedgerCloseMeta) error {
 	m.lock.Lock()
 	m.eventsByLedger.Append(bucket)
 	m.lock.Unlock()
-	return err
+	m.eventsDurationMetric.With(prometheus.Labels{"operation": "ingest"}).
+		Observe(time.Since(startTime).Seconds())
+	m.eventCountMetric.Observe(float64(len(events)))
+	return nil
 }
 
 func readEvents(networkPassphrase string, ledgerCloseMeta xdr.LedgerCloseMeta) (events []event, err error) {
@@ -209,21 +234,21 @@ func readEvents(networkPassphrase string, ledgerCloseMeta xdr.LedgerCloseMeta) (
 		if !tx.Result.Successful() {
 			continue
 		}
-		for i := range tx.Envelope.Operations() {
-			opIndex := uint32(i)
-			var opEvents []xdr.ContractEvent
-			opEvents, err = tx.GetOperationEvents(opIndex)
-			if err != nil {
-				return
-			}
-			for eventIndex, opEvent := range opEvents {
-				events = append(events, event{
-					contents:   opEvent,
-					txIndex:    tx.Index,
-					opIndex:    opIndex,
-					eventIndex: uint32(eventIndex),
-				})
-			}
+		txEvents, err := tx.GetDiagnosticEvents()
+		if err != nil {
+			return nil, err
+		}
+		for index, e := range txEvents {
+			events = append(events, event{
+				contents: e,
+				txIndex:  tx.Index,
+				// NOTE: we cannot really index by operation since all events
+				//       are provided as part of the transaction. However,
+				//       that shouldn't matter in practice since a transaction
+				//       can only contain a single Host Function Invocation.
+				opIndex:    0,
+				eventIndex: uint32(index),
+			})
 		}
 	}
 	return events, err

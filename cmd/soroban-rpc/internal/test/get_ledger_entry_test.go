@@ -22,16 +22,24 @@ import (
 func TestGetLedgerEntryNotFound(t *testing.T) {
 	test := NewTest(t)
 
-	ch := jhttp.NewChannel(test.server.URL, nil)
+	ch := jhttp.NewChannel(test.sorobanRPCURL(), nil)
 	client := jrpc2.NewClient(ch, nil)
 
 	sourceAccount := keypair.Root(StandaloneNetworkPassphrase).Address()
 	contractID := getContractID(t, sourceAccount, testSalt, StandaloneNetworkPassphrase)
+	contractIDHash := xdr.Hash(contractID)
 	keyB64, err := xdr.MarshalBase64(xdr.LedgerKey{
 		Type: xdr.LedgerEntryTypeContractData,
 		ContractData: &xdr.LedgerKeyContractData{
-			ContractId: contractID,
-			Key:        getContractCodeLedgerKey(),
+			Contract: xdr.ScAddress{
+				Type:       xdr.ScAddressTypeScAddressTypeContract,
+				ContractId: &contractIDHash,
+			},
+			Key: xdr.ScVal{
+				Type: xdr.ScValTypeScvLedgerKeyContractInstance,
+			},
+			Durability: xdr.ContractDataDurabilityPersistent,
+			BodyType:   xdr.ContractEntryBodyTypeDataEntry,
 		},
 	})
 	require.NoError(t, err)
@@ -48,7 +56,7 @@ func TestGetLedgerEntryNotFound(t *testing.T) {
 func TestGetLedgerEntryInvalidParams(t *testing.T) {
 	test := NewTest(t)
 
-	ch := jhttp.NewChannel(test.server.URL, nil)
+	ch := jhttp.NewChannel(test.sorobanRPCURL(), nil)
 	client := jrpc2.NewClient(ch, nil)
 
 	request := methods.GetLedgerEntryRequest{
@@ -64,23 +72,24 @@ func TestGetLedgerEntryInvalidParams(t *testing.T) {
 func TestGetLedgerEntrySucceeds(t *testing.T) {
 	test := NewTest(t)
 
-	ch := jhttp.NewChannel(test.server.URL, nil)
+	ch := jhttp.NewChannel(test.sorobanRPCURL(), nil)
 	client := jrpc2.NewClient(ch, nil)
 
 	kp := keypair.Root(StandaloneNetworkPassphrase)
 	account := txnbuild.NewSimpleAccount(kp.Address(), 0)
 
-	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
+	params := preflightTransactionParams(t, client, txnbuild.TransactionParams{
 		SourceAccount:        &account,
 		IncrementSequenceNum: true,
 		Operations: []txnbuild.Operation{
-			createInstallContractCodeOperation(t, account.AccountID, testContract, true),
+			createInstallContractCodeOperation(account.AccountID, testContract),
 		},
 		BaseFee: txnbuild.MinBaseFee,
 		Preconditions: txnbuild.Preconditions{
 			TimeBounds: txnbuild.NewInfiniteTimeout(),
 		},
 	})
+	tx, err := txnbuild.NewTransaction(params)
 	assert.NoError(t, err)
 	tx, err = tx.Sign(StandaloneNetworkPassphrase, kp)
 	assert.NoError(t, err)
@@ -96,9 +105,7 @@ func TestGetLedgerEntrySucceeds(t *testing.T) {
 	txStatusResponse := getTransaction(t, client, sendTxResponse.Hash)
 	assert.Equal(t, methods.TransactionStatusSuccess, txStatusResponse.Status)
 
-	installContractCodeArgs, err := xdr.InstallContractCodeArgs{Code: testContract}.MarshalBinary()
-	assert.NoError(t, err)
-	contractHash := sha256.Sum256(installContractCodeArgs)
+	contractHash := sha256.Sum256(testContract)
 	keyB64, err := xdr.MarshalBase64(xdr.LedgerKey{
 		Type: xdr.LedgerEntryTypeContractCode,
 		ContractCode: &xdr.LedgerKeyContractCode{
@@ -117,5 +124,5 @@ func TestGetLedgerEntrySucceeds(t *testing.T) {
 	assert.GreaterOrEqual(t, result.LatestLedger, result.LastModifiedLedger)
 	var entry xdr.LedgerEntryData
 	assert.NoError(t, xdr.SafeUnmarshalBase64(result.XDR, &entry))
-	assert.Equal(t, testContract, entry.MustContractCode().Code)
+	assert.Equal(t, testContract, *entry.MustContractCode().Body.Code)
 }

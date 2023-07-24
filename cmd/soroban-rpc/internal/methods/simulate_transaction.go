@@ -8,6 +8,7 @@ import (
 	"github.com/stellar/go/support/log"
 	"github.com/stellar/go/xdr"
 
+	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/db"
 	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/preflight"
 )
 
@@ -20,25 +21,29 @@ type SimulateTransactionCost struct {
 	MemoryBytes     uint64 `json:"memBytes,string"`
 }
 
-type SimulateTransactionResult struct {
-	Auth      []string `json:"auth"`
-	Footprint string   `json:"footprint"`
-	XDR       string   `json:"xdr"`
+// SimulateHostFunctionResult contains the simulation result of each HostFunction within the single InvokeHostFunctionOp allowed in a Transaction
+type SimulateHostFunctionResult struct {
+	Auth []string `json:"auth"`
+	XDR  string   `json:"xdr"`
 }
 
 type SimulateTransactionResponse struct {
-	Error        string                      `json:"error,omitempty"`
-	Results      []SimulateTransactionResult `json:"results,omitempty"`
-	Cost         SimulateTransactionCost     `json:"cost"`
-	LatestLedger int64                       `json:"latestLedger,string"`
+	Error           string                       `json:"error,omitempty"`
+	TransactionData string                       `json:"transactionData"` // SorobanTransactionData XDR in base64
+	Events          []string                     `json:"events"`          // DiagnosticEvent XDR in base64
+	MinResourceFee  int64                        `json:"minResourceFee,string"`
+	Results         []SimulateHostFunctionResult `json:"results,omitempty"` // an array of the individual host function call results
+	Cost            SimulateTransactionCost      `json:"cost"`              // the effective cpu and memory cost of the invoked transaction execution.
+	LatestLedger    int64                        `json:"latestLedger,string"`
 }
 
 type PreflightGetter interface {
-	GetPreflight(ctx context.Context, sourceAccount xdr.AccountId, op xdr.InvokeHostFunctionOp) (preflight.Preflight, error)
+	GetPreflight(ctx context.Context, readTx db.LedgerEntryReadTx, sourceAccount xdr.AccountId, opBody xdr.OperationBody, footprint xdr.LedgerFootprint) (preflight.Preflight, error)
 }
 
 // NewSimulateTransactionHandler returns a json rpc handler to run preflight simulations
-func NewSimulateTransactionHandler(logger *log.Entry, getter PreflightGetter) jrpc2.Handler {
+func NewSimulateTransactionHandler(logger *log.Entry, ledgerEntryReader db.LedgerEntryReader, getter PreflightGetter) jrpc2.Handler {
+
 	return handler.New(func(ctx context.Context, request SimulateTransactionRequest) SimulateTransactionResponse {
 		var txEnvelope xdr.TransactionEnvelope
 		if err := xdr.SafeUnmarshalBase64(request.Transaction, &txEnvelope); err != nil {
@@ -59,40 +64,64 @@ func NewSimulateTransactionHandler(logger *log.Entry, getter PreflightGetter) jr
 		if opSourceAccount := op.SourceAccount; opSourceAccount != nil {
 			sourceAccount = opSourceAccount.ToAccountId()
 		} else {
-			// FIXME: SourceAccount() panics, so, the user can doctor an envelope which makes the server crash
 			sourceAccount = txEnvelope.SourceAccount().ToAccountId()
 		}
 
-		xdrOp, ok := op.Body.GetInvokeHostFunctionOp()
-		if !ok {
+		footprint := xdr.LedgerFootprint{}
+		switch op.Body.Type {
+		case xdr.OperationTypeInvokeHostFunction:
+		case xdr.OperationTypeBumpFootprintExpiration, xdr.OperationTypeRestoreFootprint:
+			if txEnvelope.Type != xdr.EnvelopeTypeEnvelopeTypeTx && txEnvelope.V1.Tx.Ext.V != 1 {
+				return SimulateTransactionResponse{
+					Error: "To perform a SimulateTransaction for BumpFootprintExpiration or RestoreFootprint operations, SorobanTransactionData must be provided",
+				}
+			}
+			footprint = txEnvelope.V1.Tx.Ext.SorobanData.Resources.Footprint
+		default:
 			return SimulateTransactionResponse{
-				Error: "Transaction does not contain invoke host function operation",
+				Error: "Transaction contains unsupported operation type: " + op.Body.Type.String(),
 			}
 		}
 
-		result, err := getter.GetPreflight(ctx, sourceAccount, xdrOp)
+		readTx, err := ledgerEntryReader.NewTx(ctx)
 		if err != nil {
-			// GetPreflight fills in the latest ledger it used
-			// even in case of error
+			return SimulateTransactionResponse{
+				Error: "Cannot create read transaction",
+			}
+		}
+		defer func() {
+			_ = readTx.Done()
+		}()
+		latestLedger, err := readTx.GetLatestLedgerSequence()
+		if err != nil {
+			return SimulateTransactionResponse{
+				Error: err.Error(),
+			}
+		}
+
+		result, err := getter.GetPreflight(ctx, readTx, sourceAccount, op.Body, footprint)
+		if err != nil {
 			return SimulateTransactionResponse{
 				Error:        err.Error(),
-				LatestLedger: int64(result.LatestLedger),
+				LatestLedger: int64(latestLedger),
 			}
 		}
 
 		return SimulateTransactionResponse{
-			Results: []SimulateTransactionResult{
+			Results: []SimulateHostFunctionResult{
 				{
-					Auth:      result.Auth,
-					Footprint: result.Footprint,
-					XDR:       result.Result,
+					XDR:  result.Result,
+					Auth: result.Auth,
 				},
 			},
+			Events:          result.Events,
+			TransactionData: result.TransactionData,
+			MinResourceFee:  result.MinFee,
 			Cost: SimulateTransactionCost{
 				CPUInstructions: result.CPUInstructions,
 				MemoryBytes:     result.MemoryBytes,
 			},
-			LatestLedger: int64(result.LatestLedger),
+			LatestLedger: int64(latestLedger),
 		}
 	})
 }

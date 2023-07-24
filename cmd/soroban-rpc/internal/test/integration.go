@@ -3,7 +3,6 @@ package test
 import (
 	"context"
 	"fmt"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,6 +21,7 @@ import (
 	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/config"
 	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/daemon"
 	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/db"
+	"github.com/stellar/soroban-tools/cmd/soroban-rpc/internal/ledgerbucketwindow"
 )
 
 const (
@@ -33,6 +33,8 @@ const (
 	friendbotURL                = "http://localhost:8000/friendbot"
 	// Needed when Core is run with ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING=true
 	checkpointFrequency = 8
+	sorobanRPCPort      = 8000
+	adminPort           = 8080
 )
 
 type Test struct {
@@ -41,7 +43,6 @@ type Test struct {
 	composePath string // docker compose yml file
 
 	daemon *daemon.Daemon
-	server *httptest.Server
 
 	coreClient *stellarcore.Client
 
@@ -53,6 +54,10 @@ func NewTest(t *testing.T) *Test {
 	if os.Getenv("SOROBAN_RPC_INTEGRATION_TESTS_ENABLED") == "" {
 		t.Skip("skipping integration test: SOROBAN_RPC_INTEGRATION_TESTS_ENABLED not set")
 	}
+	coreBinaryPath := os.Getenv("SOROBAN_RPC_INTEGRATION_TESTS_CAPTIVE_CORE_BIN")
+	if coreBinaryPath == "" {
+		t.Fatal("missing SOROBAN_RPC_INTEGRATION_TESTS_CAPTIVE_CORE_BIN")
+	}
 
 	i := &Test{
 		t:           t,
@@ -63,9 +68,17 @@ func NewTest(t *testing.T) *Test {
 	i.coreClient = &stellarcore.Client{URL: "http://localhost:" + strconv.Itoa(stellarCorePort)}
 	i.waitForCore()
 	i.waitForCheckpoint()
-	i.launchDaemon()
+	i.launchDaemon(coreBinaryPath)
 
 	return i
+}
+
+func (i *Test) sorobanRPCURL() string {
+	return fmt.Sprintf("http://localhost:%d", sorobanRPCPort)
+}
+
+func (i *Test) adminURL() string {
+	return fmt.Sprintf("http://localhost:%d", adminPort)
 }
 
 func (i *Test) waitForCheckpoint() {
@@ -89,12 +102,10 @@ func (i *Test) waitForCheckpoint() {
 	i.t.Fatal("Core could not reach checkpoint ledger after 30s")
 }
 
-func (i *Test) launchDaemon() {
-	coreBinaryPath := os.Getenv("SOROBAN_RPC_INTEGRATION_TESTS_CAPTIVE_CORE_BIN")
-	if coreBinaryPath == "" {
-		i.t.Fatal("missing SOROBAN_RPC_INTEGRATION_TESTS_CAPTIVE_CORE_BIN")
-	}
-	config := config.LocalConfig{
+func (i *Test) launchDaemon(coreBinaryPath string) {
+	config := config.Config{
+		Endpoint:                         fmt.Sprintf("localhost:%d", sorobanRPCPort),
+		AdminEndpoint:                    fmt.Sprintf("localhost:%d", adminPort),
 		StellarCoreURL:                   "http://localhost:" + strconv.Itoa(stellarCorePort),
 		CoreRequestTimeout:               time.Second * 2,
 		StellarCoreBinaryPath:            coreBinaryPath,
@@ -107,17 +118,18 @@ func (i *Test) launchDaemon() {
 		HistoryArchiveURLs:               []string{"http://localhost:1570"},
 		LogLevel:                         logrus.DebugLevel,
 		SQLiteDBPath:                     path.Join(i.t.TempDir(), "soroban_rpc.sqlite"),
-		LedgerEntryStorageTimeout:        10 * time.Minute,
-		EventLedgerRetentionWindow:       17280,
+		IngestionTimeout:                 10 * time.Minute,
+		EventLedgerRetentionWindow:       ledgerbucketwindow.DefaultEventLedgerRetentionWindow,
 		TransactionLedgerRetentionWindow: 1440,
 		CheckpointFrequency:              checkpointFrequency,
 		MaxEventsLimit:                   10000,
 		DefaultEventsLimit:               100,
 		MaxHealthyLedgerLatency:          time.Second * 10,
 		PreflightWorkerCount:             uint(runtime.NumCPU()),
+		PreflightWorkerQueueSize:         uint(runtime.NumCPU()),
 	}
-	i.daemon = daemon.MustNew(config)
-	i.server = httptest.NewServer(i.daemon)
+	i.daemon = daemon.MustNew(&config)
+	go i.daemon.Run()
 
 	// wait for the storage to catch up for 1 minute
 	info, err := i.coreClient.Info(context.Background())
@@ -169,9 +181,6 @@ func (i *Test) runComposeCommand(args ...string) {
 func (i *Test) prepareShutdownHandlers() {
 	i.shutdownCalls = append(i.shutdownCalls,
 		func() {
-			if i.server != nil {
-				i.server.Close()
-			}
 			if i.daemon != nil {
 				i.daemon.Close()
 			}

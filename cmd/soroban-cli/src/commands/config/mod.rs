@@ -1,9 +1,14 @@
-use clap::Parser;
+use std::path::PathBuf;
+
+use clap::{arg, command, Parser};
 use serde::{Deserialize, Serialize};
 use soroban_ledger_snapshot::LedgerSnapshot;
 
-use self::network::Network;
+use crate::Pwd;
 
+use self::{network::Network, secret::Secret};
+
+pub mod events_file;
 pub mod identity;
 pub mod ledger_file;
 pub mod locator;
@@ -13,11 +18,11 @@ pub mod secret;
 #[derive(Debug, Parser)]
 pub enum Cmd {
     /// Configure different identities to sign transactions.
-    #[clap(subcommand)]
+    #[command(subcommand)]
     Identity(identity::Cmd),
 
     /// Configure different networks
-    #[clap(subcommand)]
+    #[command(subcommand)]
     Network(network::Cmd),
 }
 
@@ -37,11 +42,6 @@ pub enum Error {
 
     #[error(transparent)]
     Config(#[from] locator::Error),
-
-    #[error(
-        "Cannot sign transaction; no identity or key provided, e.g. --identity bob or --key S.."
-    )]
-    NoIdentityOrKey,
 }
 
 impl Cmd {
@@ -54,57 +54,70 @@ impl Cmd {
     }
 }
 
-#[derive(Debug, clap::Args, Clone)]
+#[derive(Debug, clap::Args, Clone, Default)]
+#[group(skip)]
 pub struct Args {
-    /// Secret Key used to sign transaction sent to the rpc server
-    #[clap(long, conflicts_with = "identity", env = "SOROBAN_SECRET_KEY")]
-    pub secret_key: Option<String>,
-
-    #[clap(flatten)]
+    #[command(flatten)]
     pub network: network::Args,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     pub ledger_file: ledger_file::Args,
 
-    #[clap(long, alias = "as", conflicts_with = "secret-key")]
-    /// Use specified identity to sign transaction
-    pub identity: Option<String>,
+    #[arg(long, alias = "source", env = "SOROBAN_ACCOUNT")]
+    /// Account that signs the final transaction. Alias `source`. Can be an identity (--source alice), a secret key (--source SC36…), or a seed phrase (--source "kite urban…"). Default: `identity generate --default-seed`
+    pub source_account: Option<String>,
 
-    #[clap(long)]
-    /// If using a seed phrase, which hd path to use, e.g. `m/44'/148'/{hd_path}`
+    #[arg(long)]
+    /// If using a seed phrase, which hierarchical deterministic path to use, e.g. `m/44'/148'/{hd_path}`. Example: `--hd-path 1`. Default: `0`
     pub hd_path: Option<usize>,
+
+    #[command(flatten)]
+    pub locator: locator::Args,
 }
 
 impl Args {
     pub fn key_pair(&self) -> Result<ed25519_dalek::Keypair, Error> {
-        let key = if let Some(secret_key) = &self.secret_key {
-            secret::Secret::SecretKey {
-                secret_key: secret_key.clone(),
-            }
-        } else if let Some(identity) = &self.identity {
-            locator::read_identity(identity)?
+        let key = if let Some(source_account) = &self.source_account {
+            self.account(source_account)?
         } else {
-            return Err(Error::NoIdentityOrKey);
+            secret::Secret::test_seed_phrase()?
         };
+
         Ok(key.key_pair(self.hd_path)?)
     }
 
+    pub fn account(&self, account_str: &str) -> Result<Secret, Error> {
+        if let Ok(secret) = self.locator.read_identity(account_str) {
+            Ok(secret)
+        } else {
+            Ok(account_str.parse::<Secret>()?)
+        }
+    }
+
     pub fn get_network(&self) -> Result<Network, Error> {
-        Ok(self.network.get_network()?)
+        Ok(self.network.get(&self.locator)?)
     }
 
     pub fn is_no_network(&self) -> bool {
-        self.network.network.is_none()
-            && self.network.network_passphrase.is_none()
-            && self.network.rpc_url.is_none()
+        self.network.is_no_network()
     }
 
     pub fn get_state(&self) -> Result<LedgerSnapshot, Error> {
-        Ok(self.ledger_file.read()?)
+        Ok(self.ledger_file.read(&self.locator.config_dir()?)?)
     }
 
     pub fn set_state(&self, state: &mut LedgerSnapshot) -> Result<(), Error> {
-        Ok(self.ledger_file.write(state)?)
+        Ok(self.ledger_file.write(state, &self.locator.config_dir()?)?)
+    }
+
+    pub fn config_dir(&self) -> Result<PathBuf, Error> {
+        Ok(self.locator.config_dir()?)
+    }
+}
+
+impl Pwd for Args {
+    fn set_pwd(&mut self, pwd: &std::path::Path) {
+        self.locator.set_pwd(pwd);
     }
 }
 

@@ -1,11 +1,18 @@
-#![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate,
+    clippy::missing_panics_doc
+)]
 pub mod commands;
+pub mod fee;
+pub mod log;
 pub mod network;
 pub mod rpc;
-pub mod strval;
 pub mod toid;
 pub mod utils;
 pub mod wasm;
+
+use std::path::Path;
 
 pub use commands::Root;
 
@@ -15,7 +22,7 @@ where
 {
     let input = shlex::split(s).ok_or_else(|| {
         clap::Error::raw(
-            clap::ErrorKind::InvalidValue,
+            clap::error::ErrorKind::InvalidValue,
             format!("Invalid input for command:\n{s}"),
         )
     })?;
@@ -24,6 +31,8 @@ where
 
 pub trait CommandParser<T> {
     fn parse(s: &str) -> Result<T, clap::Error>;
+
+    fn parse_arg_vec(s: &[&str]) -> Result<T, clap::Error>;
 }
 
 impl<T> CommandParser<T> for T
@@ -33,4 +42,12 @@ where
     fn parse(s: &str) -> Result<T, clap::Error> {
         parse_cmd(s)
     }
+
+    fn parse_arg_vec(args: &[&str]) -> Result<T, clap::Error> {
+        T::from_arg_matches_mut(&mut T::command().no_binary_name(true).get_matches_from(args))
+    }
+}
+
+pub trait Pwd {
+    fn set_pwd(&mut self, pwd: &Path);
 }
